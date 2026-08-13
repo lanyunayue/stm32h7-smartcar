@@ -3,132 +3,389 @@
  * @brief PID 控制器实现
  * @author 巫伟鑫
  * @date 2024-08-12
+ *
+ * 【说明】
+ * 本文件实现了 PID（比例-积分-微分）控制器，包含两种形式：
+ *   1. 位置式 PID —— 输出是控制量的绝对值（比如 PWM 占空比）
+ *   2. 增量式 PID —— 输出是控制量的增量（比如 PWM 占空比的变化量）
+ *
+ * 【PID 基本原理】
+ * PID 控制器根据目标值和实际值的误差（error = target - current），
+ * 通过比例（P）、积分（I）、微分（D）三项的加权和来计算输出：
+ *
+ *   Output = Kp * e(t) + Ki * ∫e(t)dt + Kd * de(t)/dt
+ *
+ * 其中：
+ *   Kp —— 比例系数，决定响应速度，太大容易振荡
+ *   Ki —— 积分系数，消除静差，太大容易超调和积分饱和
+ *   Kd —— 微分系数，抑制振荡，太大容易放大噪声
+ *
+ * 【调参口诀（经典 Ziegler-Nichols 方法的简化版）】
+ *   参数整定找最佳，从小到大顺序查
+ *   先是比例后积分，最后再把微分加
+ *   曲线振荡很频繁，比例度盘要放大
+ *   曲线漂浮绕大湾，比例度盘往小扳
+ *
+ * 【学习笔记】
+ * 别看 PID 公式简单，真正调参的时候才发现水很深。
+ * 我最开始调速度环的时候，调了好几天都调不好，
+ * 后来学长教我用串口把速度数据打出来，用 Excel 画曲线，
+ * 看着曲线调参数，效率一下子就上来了。
  */
 
 #include "pid.h"
 
+/* ================================================================
+ *                        PID 初始化函数
+ * ================================================================ */
+
 /**
  * @brief  PID 控制器初始化
+ * @param  pid:         PID 结构体指针
+ * @param  kp:          比例系数
+ * @param  ki:          积分系数
+ * @param  kd:          微分系数
+ * @param  max_output:  输出最大值（输出限幅）
+ * @param  max_integral: 积分最大值（积分限幅，防止积分饱和）
+ *
+ * 【为什么需要输出限幅和积分限幅？】
+ * 输出限幅：执行器（比如电机 PWM）有物理上限，
+ *          输出超过这个上限没有意义，还可能导致积分饱和。
+ *
+ * 积分限幅：积分项是累积的，如果长时间有偏差，
+ *          积分项会越来越大，导致输出饱和。
+ *          即使后来误差反向了，积分项还需要很久才能降下来，
+ *          这就是"积分饱和"现象，会导致严重的超调。
+ *          所以要给积分项设一个上限，累积到一定程度就不再增加了。
  */
 void PID_Init(PID_t *pid, float kp, float ki, float kd,
               float max_output, float max_integral)
 {
-    pid->kp = kp;
-    pid->ki = ki;
-    pid->kd = kd;
-    pid->max_output = max_output;
-    pid->max_integral = max_integral;
+    /* ---------- PID 参数 ---------- */
+    pid->kp = kp;           /* 比例系数 */
+    pid->ki = ki;           /* 积分系数 */
+    pid->kd = kd;           /* 微分系数 */
 
-    pid->target = 0.0f;
-    pid->current = 0.0f;
-    pid->error = 0.0f;
-    pid->last_error = 0.0f;
-    pid->prev_error = 0.0f;
-    pid->integral = 0.0f;
-    pid->derivative = 0.0f;
-    pid->output = 0.0f;
+    /* ---------- 限幅参数 ---------- */
+    pid->max_output = max_output;      /* 输出限幅（正负数都限制到 ±max_output） */
+    pid->max_integral = max_integral;  /* 积分限幅（防止积分饱和） */
 
-    pid->integral_separation_enabled = false;
-    pid->integral_threshold = 0.0f;
+    /* ---------- 状态变量清零 ----------
+     * 确保 PID 从干净的状态开始，
+     * 避免未初始化的随机值导致输出跳变 */
+    pid->target = 0.0f;       /* 目标值 */
+    pid->current = 0.0f;      /* 当前值（反馈值） */
+    pid->error = 0.0f;        /* 当前误差 = target - current */
+    pid->last_error = 0.0f;   /* 上一次误差（用于微分项计算） */
+    pid->prev_error = 0.0f;   /* 上上次误差（增量式 PID 用） */
+
+    pid->integral = 0.0f;     /* 积分项累积值 */
+    pid->derivative = 0.0f;   /* 微分项 */
+
+    pid->output = 0.0f;       /* PID 输出值 */
+
+    /* ---------- 积分分离功能默认关闭 ----------
+     * 积分分离是另一种防止积分饱和的方法，
+     * 默认关闭，需要的话调用 PID_SetIntegralSeparation 开启 */
+    pid->integral_separation_enabled = false;  /* 是否启用积分分离 */
+    pid->integral_threshold = 0.0f;            /* 积分分离阈值 */
 }
+
+/* ================================================================
+ *                       设置目标值
+ * ================================================================ */
 
 /**
  * @brief  设置 PID 目标值
+ * @param  pid:    PID 结构体指针
+ * @param  target: 目标值
+ *
+ * 【注意】
+ * 修改目标值的时候，积分项不会自动清零。
+ * 如果目标值变化很大，可能会导致超调。
+ * 这时候可以考虑用积分分离，或者手动调用 PID_Reset。
  */
 void PID_SetTarget(PID_t *pid, float target)
 {
     pid->target = target;
 }
 
+/* ================================================================
+ *                     位置式 PID 计算
+ * ================================================================ */
+
 /**
  * @brief  位置式 PID 计算
+ * @param  pid:     PID 结构体指针
+ * @param  current: 当前反馈值
+ * @return PID 输出值
+ *
+ * 【位置式 PID 公式】
+ *   Output = Kp * e(k) + Ki * Σe(i) + Kd * (e(k) - e(k-1))
+ *
+ * 其中：
+ *   e(k)   —— 当前误差
+ *   Σe(i)  —— 误差的积分（累积和）
+ *   e(k-1) —— 上一次的误差
+ *
+ * 【特点】
+ *   ✅ 输出是控制量的绝对值，直观易懂
+ *   ✅ 适合大多数调节场景（速度、温度、压力等）
+ *   ❌ 积分项是全局累积的，切换模式时需要重置
+ *   ❌ 输出限幅后容易产生积分饱和
+ *
+ * 【适用场景】
+ *   - 电机速度控制
+ *   - 温度控制
+ *   - 液位控制
+ *   - 等等需要调节到某个固定值的系统
  */
 float PID_Calc_Position(PID_t *pid, float current)
 {
-    pid->current = current;
-    pid->error = pid->target - pid->current;
+    /* ----- 步骤 1：计算当前误差 ----- */
+    pid->current = current;                       /* 保存当前值 */
+    pid->error = pid->target - pid->current;      /* 误差 = 目标值 - 当前值 */
 
-    /* 比例项 */
-    float p_term = pid->kp * pid->error;
+    /* ----- 步骤 2：计算比例项（P） -----
+     * 比例项是最基本的控制作用，误差越大输出越大，
+     * 让系统快速趋近目标。但只有 P 会有静差。 */
+    float p_term = pid->kp * pid->error;          /* 比例项 = Kp * 误差 */
 
-    /* 积分项（带积分分离） */
+    /* ----- 步骤 3：计算积分项（I） -----
+     * 积分项把历史误差累积起来，用来消除静差。
+     * 因为只要有误差，积分就在不断增加，
+     * 直到误差为零积分才停止变化。
+     *
+     * 【积分分离】
+     * 如果启用了积分分离，当误差大于阈值时暂停积分，
+     * 这样可以避免大偏差时积分累积太多导致超调。
+     * 比如电机启动的时候，目标速度和实际速度差很多，
+     * 这时候如果积分一直在累积，等速度上去了积分已经很大了，
+     * 就会冲过目标值很多（超调）。 */
+
     if (pid->integral_separation_enabled) {
+        /* 积分分离模式：只有误差比较小的时候才积分
+         * 误差大的时候不积分，防止积分饱和 */
         if (fabsf(pid->error) < pid->integral_threshold) {
             pid->integral += pid->error;
         }
+        /* 误差大的时候积分保持不变 */
     } else {
+        /* 普通模式：每次都积分 */
         pid->integral += pid->error;
     }
 
-    /* 积分限幅 */
+    /* 【积分限幅】
+     * 即使有积分分离，积分项也不能无限累积，
+     * 给积分项设一个上限和下限。
+     * 注意：积分限幅要乘 Ki 之前做还是之后做？
+     * 这里是在累积值上做限幅（乘 Ki 之前），
+     * 这样 Ki 变化的时候积分限幅也会跟着变。
+     * 也有人喜欢在乘 Ki 之后做，效果差不多，看个人习惯。 */
     if (pid->integral > pid->max_integral) {
-        pid->integral = pid->max_integral;
+        pid->integral = pid->max_integral;        /* 正向限幅 */
     } else if (pid->integral < -pid->max_integral) {
-        pid->integral = -pid->max_integral;
+        pid->integral = -pid->max_integral;       /* 负向限幅 */
     }
 
-    float i_term = pid->ki * pid->integral;
+    float i_term = pid->ki * pid->integral;       /* 积分项 = Ki * 积分累积值 */
 
-    /* 微分项 */
-    pid->derivative = pid->error - pid->last_error;
-    float d_term = pid->kd * pid->derivative;
+    /* ----- 步骤 4：计算微分项（D） -----
+     * 微分项反映误差的变化趋势（变化率），
+     * 误差在减小的话，微分项是负的，会减小输出，
+     * 起到"刹车"的作用，抑制超调和振荡。
+     *
+     * 注意：微分项对噪声很敏感！
+     * 如果反馈信号有噪声，微分项会把噪声放大，
+     * 导致输出抖动。所以 D 不能太大，
+     * 而且最好在微分之前先对反馈信号做滤波。
+     *
+     * 这里用的是最简单的差分近似：
+     *   de/dt ≈ (e(k) - e(k-1)) / T
+     * 因为我们假设采样周期 T 是固定的，所以把 1/T 吸收到 Kd 里了。
+     * 也就是说，这里的 Kd 实际上是 Kd / T。 */
+    pid->derivative = pid->error - pid->last_error;  /* 误差变化量 */
+    float d_term = pid->kd * pid->derivative;         /* 微分项 = Kd * 误差变化量 */
 
-    /* 输出计算 */
+    /* ----- 步骤 5：计算总输出 -----
+     * 输出 = 比例项 + 积分项 + 微分项 */
     pid->output = p_term + i_term + d_term;
 
-    /* 输出限幅 */
+    /* ----- 步骤 6：输出限幅 -----
+     * 执行器有物理限制（比如 PWM 占空比不能超过 100%），
+     * 输出超过限制就没有意义了，而且还会加剧积分饱和。
+     *
+     * 【思考】更完善的抗积分饱和方法：
+     * 当输出已经饱和时，如果积分项还在让输出更饱和，
+     * 就不应该继续积分了（只有反向误差才积分）。
+     * 这叫"遇限削弱积分法"，比单纯的积分限幅效果更好。
+     * 目前这个版本还没实现，以后可以加。 */
     if (pid->output > pid->max_output) {
-        pid->output = pid->max_output;
+        pid->output = pid->max_output;          /* 正向限幅 */
     } else if (pid->output < -pid->max_output) {
-        pid->output = -pid->max_output;
+        pid->output = -pid->max_output;         /* 负向限幅 */
     }
 
-    /* 保存误差 */
+    /* ----- 步骤 7：保存历史误差 -----
+     * 把当前误差存起来，下一次计算微分项要用
+     * 注意：一定要在最后存，不然微分项就不对了 */
     pid->last_error = pid->error;
 
     return pid->output;
 }
 
+/* ================================================================
+ *                     增量式 PID 计算
+ * ================================================================ */
+
 /**
  * @brief  增量式 PID 计算
+ * @param  pid:     PID 结构体指针
+ * @param  current: 当前反馈值
+ * @return PID 输出增量（delta_output）
+ *
+ * 【增量式 PID 公式推导】
+ * 位置式：
+ *   u(k) = Kp*e(k) + Ki*Σe(i) + Kd*(e(k)-e(k-1))
+ *   u(k-1) = Kp*e(k-1) + Ki*Σe(i-1) + Kd*(e(k-1)-e(k-2))
+ *
+ * 两式相减得到增量：
+ *   Δu(k) = u(k) - u(k-1)
+ *         = Kp*(e(k)-e(k-1)) + Ki*e(k) + Kd*(e(k)-2e(k-1)+e(k-2))
+ *
+ * 其中：
+ *   e(k)   —— 当前误差
+ *   e(k-1) —— 上一次误差
+ *   e(k-2) —— 上上次误差
+ *
+ * 【特点】
+ *   ✅ 输出是增量，误动作影响小（比如算错了一次，只是加/减错了一点）
+ *   ✅ 切换模式的时候冲击小（不需要清零积分）
+ *   ✅ 没有积分累积的概念，自然不会有积分饱和问题
+ *   ❌ 输出是增量，需要累加才能得到实际输出
+ *   ❌ 积分作用弱一些，静差可能比位置式大
+ *
+ * 【适用场景】
+ *   - 步进电机位置控制（每次走一步，增量控制很合适）
+ *   - 阀门开度控制
+ *   - 其他适合增量调节的场景
+ *
+ * 【注意】
+ * 这个函数返回的是输出的增量（delta），
+ * 调用者需要自己把增量累加到实际输出上。
+ * 比如：
+ *   float delta = PID_Calc_Incremental(&pid, current);
+ *   output += delta;
+ *   // 然后对 output 做限幅
  */
 float PID_Calc_Incremental(PID_t *pid, float current)
 {
+    /* ----- 步骤 1：计算当前误差 ----- */
     pid->current = current;
     pid->error = pid->target - pid->current;
 
-    /* 增量式公式: delta = Kp*(e(k)-e(k-1)) + Ki*e(k) + Kd*(e(k)-2e(k-1)+e(k-2)) */
+    /* ----- 步骤 2：计算增量 -----
+     *
+     * 增量式公式：
+     *   Δu = Kp*(e(k) - e(k-1))          ← 比例增量
+     *       + Ki * e(k)                   ← 积分增量（就是当前误差乘以 Ki）
+     *       + Kd*(e(k) - 2e(k-1) + e(k-2)) ← 微分增量
+     *
+     * 对比位置式：
+     * - 比例项：位置式是 Kp*e(k)，增量式是 Kp*(e(k)-e(k-1))
+     * - 积分项：位置式是 Ki*Σe(i)，增量式是 Ki*e(k)（每次加的就是这个）
+     * - 微分项：位置式是 Kd*(e(k)-e(k-1))，增量式是 Kd*(e(k)-2e(k-1)+e(k-2))
+     *          （因为微分本身就是差分，增量式是差分的差分，也就是二阶差分）
+     */
+
+    /* 比例增量 = Kp * (当前误差 - 上次误差) */
     float delta_p = pid->kp * (pid->error - pid->last_error);
+
+    /* 积分增量 = Ki * 当前误差
+     * （因为积分是累积的，每次增加的就是 Ki*e(k)） */
     float delta_i = pid->ki * pid->error;
+
+    /* 微分增量 = Kd * (当前误差 - 2*上次误差 + 上上次误差)
+     * 这是二阶差分，相当于对微分项再做一次差分 */
     float delta_d = pid->kd * (pid->error - 2.0f * pid->last_error + pid->prev_error);
 
+    /* 总增量 = 比例增量 + 积分增量 + 微分增量 */
     float delta_output = delta_p + delta_i + delta_d;
 
-    /* 更新历史误差 */
-    pid->prev_error = pid->last_error;
-    pid->last_error = pid->error;
+    /* ----- 步骤 3：更新历史误差 -----
+     * 增量式需要保存前两次的误差：
+     * prev_error ← last_error ← error
+     * （往前推一位）
+     *
+     * 注意顺序：先把 last_error 赋给 prev_error，
+     * 再把 error 赋给 last_error，顺序不能反！ */
+    pid->prev_error = pid->last_error;  /* 上上次 = 上次 */
+    pid->last_error = pid->error;       /* 上次 = 当前 */
 
     return delta_output;
 }
 
+/* ================================================================
+ *                        PID 重置
+ * ================================================================ */
+
 /**
  * @brief  重置 PID 控制器
+ * @param  pid: PID 结构体指针
+ *
+ * 把 PID 的所有状态变量清零，让它回到初始状态。
+ * 什么时候需要重置？
+ * 1. 模式切换的时候 —— 不同模式下 PID 状态不一样
+ * 2. 目标值大幅变化的时候 —— 防止积分饱和导致超调
+ * 3. 系统启动的时候 —— 确保从干净状态开始
+ *
+ * 【注意】
+ * 重置的时候 Kp、Ki、Kd 这些参数是保留的，
+ * 只清状态变量（误差、积分、输出等）。
+ * 如果要改参数，重新调用 PID_Init 就行。
  */
 void PID_Reset(PID_t *pid)
 {
-    pid->error = 0.0f;
-    pid->last_error = 0.0f;
-    pid->prev_error = 0.0f;
-    pid->integral = 0.0f;
-    pid->derivative = 0.0f;
-    pid->output = 0.0f;
+    /* 清零所有状态变量 */
+    pid->error = 0.0f;         /* 当前误差 */
+    pid->last_error = 0.0f;    /* 上一次误差 */
+    pid->prev_error = 0.0f;    /* 上上次误差 */
+    pid->integral = 0.0f;      /* 积分累积值 */
+    pid->derivative = 0.0f;    /* 微分项 */
+    pid->output = 0.0f;        /* 输出值 */
+    /* target 和 current 不用清，target 可能还要用，
+     * current 下次计算的时候会被覆盖 */
 }
+
+/* ================================================================
+ *                    积分分离功能设置
+ * ================================================================ */
 
 /**
  * @brief  启用/禁用积分分离
+ * @param  pid:       PID 结构体指针
+ * @param  enable:    true 启用，false 禁用
+ * @param  threshold: 积分分离阈值（误差绝对值小于这个值时才积分）
+ *
+ * 【什么是积分分离？】
+ * 普通 PID 在偏差很大的时候（比如启动、大幅度改变目标值），
+ * 积分项会累积很大，导致严重的超调和振荡。
+ *
+ * 积分分离的思想就是：
+ * - 当误差比较大的时候，暂停积分（只用 PD 控制）
+ * - 当误差比较小的时候，才加入积分（用 PID 控制）
+ *
+ * 这样既能保证动态响应速度，又能消除静差，
+ * 同时避免了大偏差时的积分饱和问题。
+ *
+ * 【阈值怎么选？】
+ * 一般选目标值的 10%~20% 左右作为阈值。
+ * 比如目标速度是 100cm/s，阈值可以设为 10~20cm/s。
+ * 太大了起不到积分分离的作用，太小了积分进不来静差消不掉。
+ * 具体值要根据实际调试情况调整。
  */
 void PID_SetIntegralSeparation(PID_t *pid, bool enable, float threshold)
 {
-    pid->integral_separation_enabled = enable;
-    pid->integral_threshold = threshold;
+    pid->integral_separation_enabled = enable;  /* 启用/禁用积分分离 */
+    pid->integral_threshold = threshold;        /* 设置积分分离阈值 */
 }

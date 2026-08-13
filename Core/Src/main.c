@@ -10,6 +10,23 @@
  * 执行器：直流减速电机 ×2, 舵机 ×1
  * 通信：HC-05 蓝牙模块
  * 显示：0.96寸 OLED
+ *
+ * 【说明】
+ * 本文件是整个智能车系统的入口和调度中心，采用时间片轮询的方式
+ * 来调度各个任务。之所以不用 RTOS，是因为一开始学习的时候想先
+ * 搞懂最基础的调度方式，等以后功能多了再考虑移植 FreeRTOS。
+ *
+ * 【任务周期】
+ * - 传感器任务：10ms  (100Hz)  - 读取 MPU6050、超声波等数据
+ * - 控制任务：  20ms  (50Hz)   - PID 计算、电机控制、模式逻辑
+ * - 显示任务：  100ms (10Hz)   - OLED 屏幕更新
+ * - 蓝牙任务：  50ms  (20Hz)   - 蓝牙数据接收和指令解析
+ *
+ * 【学习笔记】
+ * 时间片轮询的核心就是用一个时基计数器（g_tick_count），
+ * 每个任务根据自己的周期，在计数器满足条件时执行一次。
+ * 优点是简单、没有 OS 的开销；缺点是任务不能阻塞，
+ * 而且优先级不好控制，高优先级任务没法抢占低优先级的。
  */
 
 #include "main.h"
@@ -21,110 +38,205 @@
 #include "oled.h"
 #include "bluetooth.h"
 
-/* ========== 全局变量 ========== */
+/* ================================================================
+ *                      全局变量定义
+ * ================================================================ */
+
+/* 智能车全局状态结构体 —— 整个系统的所有状态都存在这里
+ * 这样做的好处是全局变量集中管理，不会到处乱飞 */
 SmartCar_t g_car;
 
-/* PID 控制器 */
-static PID_t g_pid_speed_left;
-static PID_t g_pid_speed_right;
-static PID_t g_pid_steer;
+/* ---------- PID 控制器实例 ----------
+ * 一共三个 PID 控制器：
+ * 1. 左轮速度环 - 控制左轮电机转速
+ * 2. 右轮速度环 - 控制右轮电机转速
+ * 3. 转向环   - 用于循迹时的方向控制（根据红外偏差输出差速）
+ */
+static PID_t g_pid_speed_left;   /* 左轮速度 PID */
+static PID_t g_pid_speed_right;  /* 右轮速度 PID */
+static PID_t g_pid_steer;        /* 转向 PID */
 
-/* 卡尔曼滤波器 */
-static KalmanAngle_t g_kalman_pitch;
-static KalmanAngle_t g_kalman_roll;
+/* ---------- 卡尔曼滤波器实例 ----------
+ * 两个角度滤波器分别对应俯仰角（Pitch）和横滚角（Roll）
+ * 偏航角（Yaw）因为加速度计测不到（重力是竖直方向的），
+ * 所以暂时没有做融合，只用陀螺仪积分，漂移会比较严重 */
+static KalmanAngle_t g_kalman_pitch;  /* 俯仰角卡尔曼滤波 */
+static KalmanAngle_t g_kalman_roll;   /* 横滚角卡尔曼滤波 */
 
-/* I2C/UART 句柄（由 CubeMX 生成，这里声明外部引用） */
-extern I2C_HandleTypeDef hi2c1;
-extern UART_HandleTypeDef huart1;
+/* ---------- 外设句柄 ----------
+ * 这些句柄是由 STM32CubeMX 生成的代码定义的，
+ * 这里用 extern 声明外部引用，方便我们在应用代码里使用 */
+extern I2C_HandleTypeDef hi2c1;    /* I2C1 句柄（接 MPU6050 和 OLED） */
+extern UART_HandleTypeDef huart1;  /* UART1 句柄（接蓝牙模块） */
 
-/* 系统时基计数 */
+/* ---------- 系统时基 ----------
+ * g_tick_count 是整个系统的时间基准，
+ * 每 10ms 加 1（在主循环的 HAL_Delay(10) 后自增）
+ * 各个任务通过判断这个计数器的值来决定是否执行
+ *
+ * 注意：用 HAL_Delay 来做时基不是很精确，因为任务执行也需要时间，
+ * 严格来说应该用定时器中断来做时基。不过对于这个项目来说够用了，
+ * 等以后精度要求高了再改成定时器中断的方式。
+ */
 static volatile uint32_t g_tick_count = 0;
 
-/* ========== 函数声明 ========== */
-static void System_Init(void);
-static void Sensor_Task(void);
-static void Control_Task(void);
-static void Display_Task(void);
-static void Bluetooth_Task(void);
+/* ================================================================
+ *                      函数声明（静态函数）
+ * ================================================================ */
+
+static void System_Init(void);       /* 系统初始化（所有外设和模块） */
+static void Sensor_Task(void);       /* 传感器数据采集任务 */
+static void Control_Task(void);      /* 控制算法任务 */
+static void Display_Task(void);      /* OLED 显示任务 */
+static void Bluetooth_Task(void);    /* 蓝牙通信任务 */
+
+/* ================================================================
+ *                          主函数
+ * ================================================================ */
 
 /**
-  * @brief  主函数
+  * @brief  主函数 - 程序从这里开始执行
+  *
+  * 执行流程：
+  * 1. HAL 库初始化
+  * 2. 系统时钟配置（由 CubeMX 生成代码完成）
+  * 3. 系统外设与模块初始化（自己写的初始化函数）
+  * 4. 显示开机画面（装个逼 ^_^）
+  * 5. 进入主循环，按时间片轮询执行各个任务
   */
 int main(void)
 {
-    /* HAL 库初始化 */
+    /* ---------- 初始化阶段 ---------- */
+
+    /* HAL 库初始化 —— 必须最先调用
+     * 主要做的事情：设置中断优先级分组、初始化 SysTick 等 */
     HAL_Init();
 
-    /* 系统时钟配置 */
+    /* 系统时钟配置 —— 把系统时钟配到 480MHz
+     * 这个函数通常由 CubeMX 生成，不用自己写
+     * H7 的时钟树很复杂，建议用 CubeMX 图形化配置 */
     SystemClock_Config();
 
-    /* 系统外设与模块初始化 */
+    /* 系统外设与模块初始化 —— 我们自己写的初始化函数
+     * 包括传感器、电机、PID、卡尔曼滤波等所有模块的初始化 */
     System_Init();
 
-    /* 显示开机画面 */
+    /* 显示开机画面
+     * 就是显示一下项目名称之类的，纯粹为了装酷 😎
+     * 实际项目里如果有启动时间要求的话可以去掉 */
     OLED_ShowSplash();
-    HAL_Delay(1500);
+    HAL_Delay(1500);  /* 停留 1.5 秒让用户看完 */
     OLED_Clear();
 
-    /* 主循环 */
+    /* ---------- 主循环阶段 ---------- */
+
+    /* 主循环 —— 程序永远在这里转圈
+     * 采用时间片轮询法调度任务，每个任务有自己的执行周期 */
     while (1) {
-        /* 10ms 任务：传感器数据采集 */
+        /* 10ms 任务：传感器数据采集
+         * 每次循环都执行（因为循环一次大约 10ms）
+         * 包括：MPU6050 读取、超声波读取、卡尔曼滤波更新 */
         Sensor_Task();
 
-        /* 20ms 任务：控制算法 */
+        /* 20ms 任务：控制算法（50Hz）
+         * 每 2 个 tick 执行一次
+         * 包括：PID 计算、电机输出、模式逻辑处理 */
         if ((g_tick_count % 2) == 0) {
             Control_Task();
         }
 
-        /* 100ms 任务：显示更新 */
+        /* 100ms 任务：显示更新（10Hz）
+         * 每 10 个 tick 执行一次
+         * OLED 刷新不需要太快，10Hz 足够了，太快了反而闪 */
         if ((g_tick_count % 10) == 0) {
             Display_Task();
         }
 
-        /* 50ms 任务：蓝牙通信 */
+        /* 50ms 任务：蓝牙通信（20Hz）
+         * 每 5 个 tick 执行一次
+         * 蓝牙指令接收和解析，不需要太频繁 */
         if ((g_tick_count % 5) == 0) {
             Bluetooth_Task();
         }
 
+        /* 延时 10ms，然后时基计数器加 1
+         * 注意：这里的延时是粗略的，因为前面的任务执行也需要时间
+         * 如果需要精确的时基，应该用定时器中断 */
         HAL_Delay(10);
         g_tick_count++;
     }
 }
 
+/* ================================================================
+ *                       系统初始化函数
+ * ================================================================ */
+
 /**
-  * @brief  系统初始化
+  * @brief  系统初始化 —— 初始化所有外设和模块
+  *
+  * 初始化顺序很重要！一般按照从底层到上层的顺序：
+  * 1. 全局状态清零
+  * 2. 硬件外设（传感器、电机、显示、通信）
+  * 3. 软件算法（PID、卡尔曼滤波）
+  * 4. 设置系统就绪标志
   */
 static void System_Init(void)
 {
-    /* 初始化全局状态 */
+    /* ----- 全局状态初始化 -----
+     * 用 memset 把整个结构体清零，确保所有变量都有确定的初始值
+     * 这是个好习惯，不然刚上电的时候内存里的值是随机的 */
     memset(&g_car, 0, sizeof(SmartCar_t));
-    g_car.mode = MODE_IDLE;
-    g_car.speed_target = 50.0f;  // 默认目标速度 50cm/s
+    g_car.mode = MODE_IDLE;           /* 默认待机模式 */
+    g_car.speed_target = 50.0f;       /* 默认目标速度 50cm/s（别太快，安全第一） */
 
-    /* MPU6050 初始化 */
+    /* ----- 传感器和外设初始化 -----
+     * 注意：I2C 和 UART 的初始化是 CubeMX 生成的代码做的，
+     * 这里调用的是我们自己封装的模块级初始化（设置寄存器、校准等） */
+
+    /* MPU6050 六轴传感器初始化
+     * 参数：I2C 句柄、陀螺仪量程（500°/s）、加速度计量程（2G）
+     * 量程选择：陀螺仪 500°/s 足够了，小车不会转那么快；
+     *          加速度计 2G 精度最高，小车运动加速度不大 */
     MPU6050_Init(&hi2c1, GYRO_RANGE_500, ACCEL_RANGE_2G);
 
-    /* 电机初始化 */
+    /* 电机驱动初始化 —— 配置 PWM 输出、GPIO 方向控制引脚 */
     Motor_Init();
 
-    /* 超声波初始化 */
+    /* 超声波传感器初始化 —— 配置 Trig 引脚输出、Echo 引脚输入捕获 */
     Ultrasonic_Init();
 
-    /* OLED 初始化 */
+    /* OLED 显示屏初始化 —— 配置 I2C 通信、初始化显示芯片 */
     OLED_Init(&hi2c1);
 
-    /* 蓝牙初始化 */
+    /* 蓝牙模块初始化 —— 配置串口、设置波特率、初始化接收缓冲区 */
     Bluetooth_Init(&huart1);
 
-    /* PID 控制器初始化 - 左轮速度环 */
-    PID_Init(&g_pid_speed_left,
-             0.8f,    // Kp
-             0.3f,    // Ki
-             0.1f,    // Kd
-             100.0f,  // 最大输出
-             50.0f);  // 积分限幅
+    /* ----- PID 控制器初始化 -----
+     *
+     * PID 参数说明：
+     * Kp - 比例系数：越大响应越快，但太大会振荡
+     * Ki - 积分系数：消除静差，但太大会超调和积分饱和
+     * Kd - 微分系数：抑制振荡，但太大会放大噪声
+     *
+     * 调参经验（仅供参考，不同电机参数不一样）：
+     * - 速度环：P 为主，I 为辅，D 可以不用或者很小
+     * - 转向环：P 要大一些，响应要快，I 可以不用（位置误差不需要积分消除）
+     */
 
-    /* PID 控制器初始化 - 右轮速度环 */
+    /* 左轮速度环 PID 初始化
+     * Kp=0.8, Ki=0.3, Kd=0.1
+     * 最大输出 100（对应 PWM 占空比百分比）
+     * 积分限幅 50（防止积分饱和） */
+    PID_Init(&g_pid_speed_left,
+             0.8f,    /* Kp 比例系数 */
+             0.3f,    /* Ki 积分系数 */
+             0.1f,    /* Kd 微分系数 */
+             100.0f,  /* 最大输出（PWM 占空比 0~100%） */
+             50.0f);  /* 积分限幅 */
+
+    /* 右轮速度环 PID 初始化
+     * 左右轮理论上参数应该一样，但实际由于电机差异可能需要微调
+     * 这里先设成一样的，实际调试的时候再根据情况改 */
     PID_Init(&g_pid_speed_right,
              0.8f,
              0.3f,
@@ -132,175 +244,424 @@ static void System_Init(void)
              100.0f,
              50.0f);
 
-    /* PID 控制器初始化 - 转向控制 */
+    /* 转向环 PID 初始化
+     * 转向环的输入是循迹偏差（比如红外传感器偏移中心的距离），
+     * 输出是左右轮的速度差（差速转向）
+     * Ki 设为 0 是因为转向是位置控制，不需要积分消除静差，
+     * 加了积分反而容易超调和振荡 */
     PID_Init(&g_pid_steer,
-             1.5f,
-             0.0f,
-             0.5f,
-             50.0f,
-             20.0f);
+             1.5f,    /* Kp - 转向要灵敏，P 大一点 */
+             0.0f,    /* Ki - 转向环不用积分 */
+             0.5f,    /* Kd - 适当加一点 D 抑制振荡 */
+             50.0f,   /* 最大输出（最大差速 50cm/s） */
+             20.0f);  /* 积分限幅（虽然 Ki=0 没用上，但初始化还是要给） */
 
-    /* 卡尔曼滤波初始化 - 俯仰角 */
-    KalmanAngle_Init(&g_kalman_pitch, 0.001f, 0.003f, 0.03f);
+    /* ----- 卡尔曼滤波初始化 -----
+     *
+     * 参数说明：
+     * q_angle   - 角度过程噪声协方差：角度的随机波动有多大
+     * q_bias    - 陀螺仪零偏过程噪声协方差：零偏变化有多快
+     * r_measure - 测量噪声协方差：加速度计的测量噪声有多大
+     *
+     * 调参经验：
+     * - q_angle 越大 → 越相信加速度计 → 响应快但噪声大
+     * - r_measure 越大 → 越相信陀螺仪积分 → 平滑但滞后
+     * - q_bias 越大 → 零偏估计变化越快 → 收敛快但可能不稳定
+     *
+     * 这些参数是我调试了好久才找到的比较合适的值，
+     * 不同的 MPU6050 模块可能需要微调 */
 
-    /* 卡尔曼滤波初始化 - 横滚角 */
-    KalmanAngle_Init(&g_kalman_roll, 0.001f, 0.003f, 0.03f);
+    /* 俯仰角卡尔曼滤波初始化 */
+    KalmanAngle_Init(&g_kalman_pitch,
+                     0.001f,   /* Q_angle：角度过程噪声 */
+                     0.003f,   /* Q_bias：零偏过程噪声 */
+                     0.03f);   /* R_measure：测量噪声 */
 
+    /* 横滚角卡尔曼滤波初始化
+     * 参数和俯仰角一样，因为两个方向的特性差不多 */
+    KalmanAngle_Init(&g_kalman_roll,
+                     0.001f,
+                     0.003f,
+                     0.03f);
+
+    /* 系统就绪标志置位 —— 所有初始化完成后再置位
+     * 控制任务里会检查这个标志，没就绪的话不执行控制逻辑，
+     * 防止初始化没完成就开始控制电机导致意外 */
     g_car.system_ready = true;
 }
 
+/* ================================================================
+ *                         传感器任务
+ * ================================================================ */
+
 /**
-  * @brief  传感器任务
+  * @brief  传感器数据采集任务（10ms 执行一次）
+  *
+  * 主要工作：
+  * 1. 读取 MPU6050 的加速度计和陀螺仪数据
+  * 2. 用加速度计计算初始角度（作为卡尔曼滤波的测量值）
+  * 3. 用卡尔曼滤波融合加速度计和陀螺仪，得到更准确的姿态角
+  * 4. 读取三路超声波距离
+  *
+  * 注意：这个任务只负责读取和处理传感器数据，
+  * 不涉及任何控制逻辑，控制逻辑统一在 Control_Task 里处理。
+  * 这样分层清晰，调试的时候也好定位问题。
   */
 static void Sensor_Task(void)
 {
-    static MPU6050_t mpu_data;
-    float distances[US_SENSOR_COUNT];
-    static float last_time = 0.0f;
-    float dt = 0.01f;  // 10ms
+    static MPU6050_t mpu_data;        /* MPU6050 数据结构体（static 保留上次的值） */
+    float distances[US_SENSOR_COUNT]; /* 超声波距离数组 */
 
-    /* 读取 MPU6050 */
+    /* 采样周期 dt = 10ms = 0.01s
+     * 注意：这里用常量是因为我们假设任务严格 10ms 执行一次，
+     * 如果实际周期不准的话，卡尔曼滤波的精度会受影响。
+     * 更严谨的做法是用定时器打时间戳，计算实际的 dt */
+    static float last_time = 0.0f;
+    float dt = 0.01f;  /* 10ms，先写死，后面再优化 */
+
+    /* ----- MPU6050 数据读取 -----
+     * 读取加速度（ax, ay, az）和陀螺仪（gx, gy, gz）的原始数据
+     * 函数内部会把原始数据转换成物理量（加速度：g，角速度：deg/s） */
     MPU6050_ReadAll(&hi2c1, &mpu_data);
 
-    /* 计算加速度计角度 */
+    /* 用加速度计计算角度（Pitch 和 Roll）
+     * 原理：利用重力加速度在各个轴上的分量，通过反三角函数计算倾角
+     * 优点：没有漂移（重力是恒定的）
+     * 缺点：受振动影响大，电机一转数据就抖得厉害 */
     MPU6050_CalcAngle(&mpu_data);
 
-    /* 卡尔曼滤波融合 */
-    g_car.pitch = KalmanAngle_Update(&g_kalman_pitch,
-                                       mpu_data.pitch,
-                                       mpu_data.gyro_y,
-                                       dt);
-    g_car.roll = KalmanAngle_Update(&g_kalman_roll,
-                                      mpu_data.roll,
-                                      mpu_data.gyro_x,
-                                      dt);
+    /* ----- 卡尔曼滤波融合 -----
+     * 输入：
+     *   acc_angle - 加速度计计算的角度（有噪声但不漂移）
+     *   gyro_rate - 陀螺仪的角速度（动态响应好但积分会漂移）
+     *   dt        - 采样周期
+     * 输出：
+     *   融合后的角度（既响应快又稳定不漂移）
+     *
+     * 为什么要融合？
+     *   加速度计：静态好，动态差（受振动影响）
+     *   陀螺仪：  动态好，静态差（积分漂移）
+     *   两者融合，取长补短 */
 
-    /* 读取超声波距离 */
+    /* 俯仰角融合（绕 X 轴旋转的角度）
+     * 注意：用的是 gyro_y（Y 轴角速度）来积分得到俯仰角，
+     * 这个和 MPU6050 的安装方向有关，具体要看坐标系定义 */
+    g_car.pitch = KalmanAngle_Update(&g_kalman_pitch,
+                                       mpu_data.pitch,      /* 加速度计计算的俯仰角 */
+                                       mpu_data.gyro_y,     /* Y 轴陀螺仪角速度 */
+                                       dt);                 /* 采样周期 */
+
+    /* 横滚角融合（绕 Y 轴旋转的角度） */
+    g_car.roll = KalmanAngle_Update(&g_kalman_roll,
+                                      mpu_data.roll,       /* 加速度计计算的横滚角 */
+                                      mpu_data.gyro_x,     /* X 轴陀螺仪角速度 */
+                                      dt);                 /* 采样周期 */
+
+    /* ----- 超声波距离读取 -----
+     * 读取三路超声波（前、左、右）的距离值
+     * 函数内部已经做了简单的滤波和异常值处理 */
     Ultrasonic_ReadAll(distances);
-    g_car.distance_front = distances[US_FRONT];
-    g_car.distance_left  = distances[US_LEFT];
-    g_car.distance_right = distances[US_RIGHT];
+
+    /* 把距离数据存到全局状态结构体里
+     * 这样其他任务（控制、显示）就可以直接用了 */
+    g_car.distance_front = distances[US_FRONT];  /* 前方距离 */
+    g_car.distance_left  = distances[US_LEFT];   /* 左方距离 */
+    g_car.distance_right = distances[US_RIGHT];  /* 右方距离 */
+
+    /* TODO：编码器速度读取还没加进来
+     * 应该在这个任务里读取编码器计数，然后计算左右轮速度，
+     * 存到 g_car.speed_left 和 g_car.speed_right 里 */
 }
 
+/* ================================================================
+ *                         控制任务
+ * ================================================================ */
+
 /**
-  * @brief  控制任务
+  * @brief  控制任务（20ms 执行一次，50Hz）
+  *
+  * 根据当前运行模式执行不同的控制逻辑：
+  * - MODE_IDLE：          待机，电机停止
+  * - MODE_TRACE：         循迹模式（红外 + PID 转向）
+  * - MODE_OBSTACLE_AVOID：避障模式（超声波 + 差速转向）
+  * - MODE_BLUETOOTH：     蓝牙遥控模式
+  * - MODE_CRUISE：        定速巡航模式（PID 速度闭环）
+  *
+  * 注意：
+  * 1. 只有 system_ready 为 true 时才执行控制逻辑，防止初始化未完成
+  * 2. 每种模式的控制逻辑独立，互不干扰
+  * 3. 模式切换时的清理工作在 Mode_Switch 函数里做
   */
 static void Control_Task(void)
 {
-    float left_output, right_output;
-    float speed_diff;
+    float left_output, right_output;  /* 左右轮 PID 输出 */
+    float speed_diff;                 /* 速度差（转向用） */
 
+    /* 系统未就绪，不执行控制逻辑
+     * 这是为了防止初始化过程中就开始控制电机，
+     * 导致意外动作（比如电机突然转起来） */
     if (!g_car.system_ready) return;
 
+    /* 根据当前模式执行对应的控制逻辑
+     * 用 switch-case 实现状态机，清晰明了 */
     switch (g_car.mode) {
+
+        /* ---------- 循迹模式 ----------
+         * 原理：用五路红外传感器检测黑线位置，计算偏差，
+         * 然后用 PID 控制左右轮的速度差，实现自动循迹。
+         *
+         * TODO：这部分还没实现完，先留个框架
+         * 需要做的事情：
+         * 1. 读取五路红外传感器的状态
+         * 2. 计算小车相对于黑线的偏移量
+         * 3. 把偏移量输入转向 PID，输出速度差
+         * 4. 左右轮分别加上/减去速度差的一半，实现差速转向
+         */
         case MODE_TRACE:
             /* 循迹模式 - 基于红外传感器 */
-            // speed_diff = Trace_Calculate();
-            // PID_SetTarget(&g_pid_steer, speed_diff);
-            // 左右轮差速控制
+            // speed_diff = Trace_Calculate();          /* 计算循迹偏差 */
+            // PID_SetTarget(&g_pid_steer, speed_diff); /* 转向 PID 计算 */
+            /* 左右轮差速控制：左轮 = 基准速度 + 差速/2，右轮 = 基准速度 - 差速/2 */
             break;
 
+        /* ---------- 避障模式 ----------
+         * 原理：用前方超声波检测障碍物距离，
+         * 如果距离小于阈值就转向，比较左右两边的距离，
+         * 哪边空间大往哪边转。
+         *
+         * 注意：这是最简单的避障策略，就是遇到障碍就转向，
+         * 没有路径规划，所以可能会在某个地方打转。
+         * 以后可以加更复杂的算法，比如沿墙走、随机转向等。
+         */
         case MODE_OBSTACLE_AVOID:
             /* 避障模式 - 基于超声波 */
             if (g_car.distance_front < 20.0f) {
-                /* 前方有障碍，转向 */
+                /* 前方有障碍（小于 20cm），需要转向
+                 * 比较左右两边的距离，哪边远往哪边转
+                 * 用原地差速转向（一轮前进一轮后退），转向半径小 */
+
                 if (g_car.distance_left > g_car.distance_right) {
+                    /* 左边空间大 → 原地左转：左退右进 */
                     Motor_SetDirection(MOTOR_LEFT, MOTOR_BACKWARD);
                     Motor_SetDirection(MOTOR_RIGHT, MOTOR_FORWARD);
                 } else {
+                    /* 右边空间大 → 原地右转：左进右退 */
                     Motor_SetDirection(MOTOR_LEFT, MOTOR_FORWARD);
                     Motor_SetDirection(MOTOR_RIGHT, MOTOR_BACKWARD);
                 }
+                /* 转向速度 30%（别太快，不然容易撞） */
                 Motor_Drive(30.0f, 30.0f);
             } else {
+                /* 前方没障碍，正常前进 */
                 Motor_SetDirection(MOTOR_LEFT, MOTOR_FORWARD);
                 Motor_SetDirection(MOTOR_RIGHT, MOTOR_FORWARD);
+                /* 以目标速度前进 —— 注意：这里是开环的！
+                 * 实际项目里应该用 PID 速度闭环，
+                 * 这里为了演示简单先直接给目标速度 */
                 Motor_Drive(g_car.speed_target, g_car.speed_target);
             }
             break;
 
+        /* ---------- 蓝牙遥控模式 ----------
+         * TODO：还没实现，留着以后做
+         * 思路：蓝牙任务把收到的指令解析成目标速度和方向，
+         * 然后在这个模式下直接输出到电机 */
         case MODE_BLUETOOTH:
             /* 蓝牙遥控模式 */
             break;
 
+        /* ---------- 定速巡航模式 ----------
+         * 原理：用 PID 速度闭环控制，让左右轮的速度
+         * 稳定在目标速度上，不管负载怎么变都能保持恒速。
+         *
+         * 这是 PID 最典型的应用场景了 —— 速度闭环控制。
+         * 没有 PID 的话，上坡会变慢、下坡会变快，
+         * 有了 PID 就能自动调整 PWM 占空比来维持速度。
+         */
         case MODE_CRUISE:
             /* 定速巡航模式 - PID 调速 */
+
+            /* 设置左右轮的目标速度
+             * 这里两个轮的目标速度是一样的（直线行驶）
+             * 如果要转向的话，给两个轮不同的目标速度就行 */
             PID_SetTarget(&g_pid_speed_left, g_car.speed_target);
             PID_SetTarget(&g_pid_speed_right, g_car.speed_target);
 
+            /* 位置式 PID 计算
+             * 输入：当前速度（来自编码器，TODO：还没接上）
+             * 输出：PWM 占空比（百分比，0~100）
+             *
+             * 为什么用位置式而不是增量式？
+             * 因为速度环是调节到一个固定的目标值，
+             * 位置式 PID 更直观，输出就是直接的控制量。
+             * 增量式更适合步进电机这种位置控制的场景。 */
             left_output = PID_Calc_Position(&g_pid_speed_left, g_car.speed_left);
             right_output = PID_Calc_Position(&g_pid_speed_right, g_car.speed_right);
 
+            /* 把 PID 输出送到电机驱动
+             * Motor_Drive 函数内部会处理方向和占空比 */
             Motor_Drive(left_output, right_output);
             break;
 
+        /* ---------- 默认情况（待机模式） ----------
+         * 所有未定义的模式都进入待机，停止电机
+         * 这是个安全措施，防止模式变量错乱导致意外 */
         default:
             Motor_StopAll();
             break;
     }
 }
 
+/* ================================================================
+ *                         显示任务
+ * ================================================================ */
+
 /**
-  * @brief  显示任务
+  * @brief  显示任务（100ms 执行一次，10Hz）
+  *
+  * 在 OLED 上显示各种信息：车速、姿态角、电池电压、模式等
+  * 显示不需要太快，10Hz 人眼就觉得流畅了，
+  * 而且 OLED 刷新太快会有闪烁感。
+  *
+  * TODO：现在只有一个主页面，以后可以做多页显示，
+  * 用按键切换：页面1 车速、页面2 姿态、页面3 PID 参数...
   */
 static void Display_Task(void)
 {
+    /* 显示主页面
+     * 具体显示内容在 oled.c 里的 OLED_ShowMainPage 函数中实现
+     * 这个函数会从 g_car 结构体里读取需要显示的数据 */
     OLED_ShowMainPage();
 }
 
+/* ================================================================
+ *                         蓝牙任务
+ * ================================================================ */
+
 /**
-  * @brief  蓝牙任务
+  * @brief  蓝牙通信任务（50ms 执行一次，20Hz）
+  *
+  * 接收蓝牙模块发来的指令，解析后执行相应操作：
+  * - 前进/停止
+  * - 切换模式（循迹/避障）
+  * - 速度加减
+  *
+  * 通信协议（自定义的简单协议）：
+  * 每个指令是一个单字节的命令码，定义在 bluetooth.h 里的 BT_Cmd_t 枚举中。
+  * 简单但够用，以后需要更复杂的功能再扩展协议。
   */
 static void Bluetooth_Task(void)
 {
+    /* 获取蓝牙指令
+     * Bluetooth_GetCommand 内部会检查接收缓冲区，
+     * 如果有新的指令就返回，没有就返回 BT_CMD_NONE */
     BT_Cmd_t cmd = Bluetooth_GetCommand();
 
+    /* 根据指令执行相应操作
+     * 注意：这里只做模式切换和参数调整，
+     * 具体的控制逻辑在 Control_Task 里执行 */
     switch (cmd) {
         case BT_CMD_FORWARD:
+            /* 前进指令 → 切换到定速巡航模式 */
             Mode_Switch(MODE_CRUISE);
             break;
+
         case BT_CMD_STOP:
+            /* 停止指令 → 切换到待机模式 */
             Mode_Switch(MODE_IDLE);
             break;
+
         case BT_CMD_MODE_TRACE:
+            /* 切换到循迹模式 */
             Mode_Switch(MODE_TRACE);
             break;
+
         case BT_CMD_MODE_AVOID:
+            /* 切换到避障模式 */
             Mode_Switch(MODE_OBSTACLE_AVOID);
             break;
+
         case BT_CMD_SPEED_UP:
+            /* 加速：目标速度增加 10cm/s
+             * 限制最大速度 100cm/s，别太快了危险 */
             if (g_car.speed_target < 100.0f)
                 g_car.speed_target += 10.0f;
             break;
+
         case BT_CMD_SPEED_DOWN:
+            /* 减速：目标速度减少 10cm/s
+             * 限制最小速度 10cm/s，别减到 0 了（停止用 STOP 指令） */
             if (g_car.speed_target > 10.0f)
                 g_car.speed_target -= 10.0f;
             break;
+
         default:
+            /* 没有指令或者未知指令，什么都不做 */
             break;
     }
 }
 
+/* ================================================================
+ *                         模式切换函数
+ * ================================================================ */
+
 /**
-  * @brief  模式切换
+  * @brief  模式切换函数
+  * @param  new_mode: 要切换到的新模式
+  *
+  * 切换模式的时候需要做一些清理工作：
+  * 1. 重置所有 PID 控制器（清积分、清历史误差）
+  * 2. 停止所有电机
+  * 3. 更新当前模式
+  *
+  * 为什么要重置 PID？
+  * 因为不同模式下 PID 的工作状态完全不一样，
+  * 如果不重置，上一个模式的积分项什么的会带过来，
+  * 切换模式的瞬间可能会有很大的输出跳变，导致小车乱窜。
   */
 void Mode_Switch(RunMode_t new_mode)
 {
+    /* 如果模式没变，直接返回，不用切换
+     * 避免重复执行切换逻辑 */
     if (new_mode == g_car.mode) return;
 
-    /* 退出当前模式 */
+    /* ----- 退出当前模式的清理工作 ----- */
+
+    /* 重置所有 PID 控制器
+     * 清除积分项、历史误差、输出值，
+     * 确保进入新模式时 PID 从干净的状态开始 */
     PID_Reset(&g_pid_speed_left);
     PID_Reset(&g_pid_speed_right);
     PID_Reset(&g_pid_steer);
+
+    /* 停止所有电机
+     * 切换模式的瞬间先停下来，防止意外动作
+     * 新模式的控制逻辑会在下一次 Control_Task 中启动电机 */
     Motor_StopAll();
 
-    /* 切换到新模式 */
+    /* ----- 切换到新模式 ----- */
     g_car.mode = new_mode;
+
+    /* TODO：以后可以加模式切换的提示音或者 OLED 显示提示 */
 }
+
+/* ================================================================
+ *                       系统时钟配置（占位）
+ * ================================================================ */
 
 /**
   * @brief  系统时钟配置
-  * @note   此函数通常由 CubeMX 生成
+  * @note   此函数通常由 CubeMX 生成，这里只是占位
+  *
+  * STM32H743 的系统时钟配置（480MHz）大致流程：
+  * 1. 配置外部高速晶振（HSE）
+  * 2. 配置 PLL1，把 HSE 倍频到 480MHz
+  * 3. 配置系统时钟源为 PLL1
+  * 4. 配置各个总线的分频系数（AHB、APB1、APB2 等）
+  *
+  * 注意：H7 的时钟树比 F1/F4 复杂很多，
+  * 建议用 STM32CubeMX 图形化配置，然后生成代码，
+  * 别自己手写时钟配置，很容易配错。
   */
 void SystemClock_Config(void)
 {
@@ -308,22 +669,62 @@ void SystemClock_Config(void)
     /* 具体配置由 CubeMX 生成代码完成 */
 }
 
+/* ================================================================
+ *                         错误处理函数
+ * ================================================================ */
+
 /**
   * @brief  错误处理函数
+  *
+  * 当系统发生严重错误时调用这个函数，比如：
+  * - 外设初始化失败
+  * - 断言失败
+  * - 其他不可恢复的错误
+  *
+  * 处理方式：
+  * - 关闭所有中断（防止错误扩散）
+  * - LED 闪烁提示错误状态
+  * - 死循环，等待用户复位
+  *
+  * TODO：以后可以加更完善的错误处理，
+  * 比如记录错误原因、自动重启等。
   */
 void Error_Handler(void)
 {
+    /* 禁用所有中断 —— 防止错误状态下中断继续执行 */
     __disable_irq();
+
+    /* 死循环 + LED 闪烁指示错误
+     * 用 LED 闪烁来表示系统出错了，
+     * 以后可以加蜂鸣器报警或者 OLED 显示错误信息 */
     while (1) {
-        /* 错误指示：LED 闪烁 */
+        /* 错误指示：LED 以 5Hz 频率闪烁（亮 200ms 灭 200ms） */
         HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_0);
         HAL_Delay(200);
     }
 }
 
+/* ================================================================
+ *                         断言失败处理
+ * ================================================================ */
+
 #ifdef USE_FULL_ASSERT
+/**
+  * @brief  断言失败处理函数
+  * @param  file: 发生断言的文件名
+  * @param  line: 发生断言的行号
+  *
+  * 当定义了 USE_FULL_ASSERT 宏时，HAL 库的断言宏会调用这个函数。
+  * 可以用来调试参数错误之类的问题。
+  *
+  * 调试版本可以打开这个宏，发布版本建议关掉，
+  * 因为断言会增加代码量和运行开销。
+  */
 void assert_failed(uint8_t *file, uint32_t line)
 {
-    /* 断言失败处理 */
+    /* 断言失败处理
+     * TODO：可以在这里加串口打印，输出文件名和行号，方便调试
+     * 比如：printf("Assert failed at %s:%lu\r\n", file, line);
+     */
 }
-#endif
+#endif /* USE_FULL_ASSERT */
